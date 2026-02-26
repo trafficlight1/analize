@@ -1000,8 +1000,52 @@ document.getElementById('logo-img').src = 'data:image/png;base64,/9j/4AAQSkZJRgA
 // ═══ MAP ══════════════════════════════════════
 const map = L.map('map', {
   zoomControl: false,
-  attributionControl: true
+  attributionControl: true,
+  minZoom: 11
 }).setView([49.84, 24.02], 13);
+
+// Load real Lviv city boundary from Nominatim and apply as maxBounds + visual mask
+async function applyLvivBounds() {
+  try {
+    const resp = await fetch(
+      'https://nominatim.openstreetmap.org/search?q=Lviv,Ukraine&format=json&polygon_geojson=1&limit=1',
+      { headers: { 'Accept-Language': 'uk' } }
+    );
+    const data = await resp.json();
+    if (!data.length || !data[0].geojson) return;
+
+    const geojson = data[0].geojson;
+
+    // Draw city boundary outline
+    const boundaryLayer = L.geoJSON(geojson, {
+      style: {
+        color: '#3a3a3a',
+        weight: 1.5,
+        opacity: 0.7,
+        fill: false,
+        interactive: false
+      }
+    }).addTo(map);
+
+    // Set map maxBounds from the bounding box
+    const bounds = boundaryLayer.getBounds();
+    map.setMaxBounds(bounds.pad(0.02));
+
+    // Block panning outside using moveend event
+    map.on('moveend', () => {
+      if (!bounds.contains(map.getCenter())) {
+        map.panInsideBounds(bounds, { animate: true });
+      }
+    });
+
+  } catch(e) {
+    // Fallback to approximate bounds
+    const fallback = L.latLngBounds(L.latLng(49.76, 23.87), L.latLng(49.93, 24.18));
+    map.setMaxBounds(fallback);
+    console.warn('Lviv boundary load failed, using fallback', e);
+  }
+}
+applyLvivBounds();
 
 L.control.zoom({ position: 'bottomright' }).addTo(map);
 
@@ -1011,6 +1055,98 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png'
   subdomains: 'abcd',
   maxZoom: 19
 }).addTo(map);
+
+// ═══ GREEN & WATER LAYERS (OSM Overpass) ═══════
+const greenLayer = L.layerGroup().addTo(map);
+const waterLayer = L.layerGroup().addTo(map);
+
+// Parks / woods — bright enough to read on dark bg
+const PARK_FILL   = '#2d5e3f';
+const PARK_BORDER = '#3d8055';
+const WOOD_FILL   = '#1f4530';
+const WOOD_BORDER = '#2d6040';
+
+// Water — bright cyan, full opacity
+const WATER_FILL   = '#29b6f6';
+const WATER_BORDER = '#4fc3f7';
+
+async function loadGreenAndWater() {
+  const bbox = '49.76,23.87,49.93,24.18';
+  const query = `
+    [out:json][timeout:40];
+    (
+      way["leisure"="park"](${bbox});
+      relation["leisure"="park"](${bbox});
+      way["natural"="wood"](${bbox});
+      relation["natural"="wood"](${bbox});
+      way["natural"="water"](${bbox});
+      relation["natural"="water"](${bbox});
+    );
+    out geom;
+  `;
+  try {
+    const resp = await fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
+      body: 'data=' + encodeURIComponent(query)
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    renderGreenAndWater(data.elements);
+  } catch(e) {
+    console.warn('Green/water load failed:', e);
+  }
+}
+
+function elementToCoords(el) {
+  if (el.type === 'way' && el.geometry) {
+    return [el.geometry.map(pt => [pt.lat, pt.lon])];
+  }
+  if (el.type === 'relation' && el.members) {
+    return el.members
+      .filter(m => m.type === 'way' && m.geometry && m.role !== 'inner')
+      .map(m => m.geometry.map(pt => [pt.lat, pt.lon]));
+  }
+  return [];
+}
+
+function renderGreenAndWater(elements) {
+  greenLayer.clearLayers();
+  waterLayer.clearLayers();
+
+  elements.forEach(el => {
+    const tag = el.tags || {};
+    const isWater = tag.natural === 'water';
+    const isWood  = tag.natural === 'wood';
+
+    const rings = elementToCoords(el);
+    if (!rings.length) return;
+
+    rings.forEach(coords => {
+      if (coords.length < 3) return;
+      if (isWater) {
+        L.polygon(coords, {
+          color: WATER_BORDER, weight: 1, opacity: 1,
+          fillColor: WATER_FILL, fillOpacity: 1,
+          interactive: false
+        }).addTo(waterLayer);
+      } else if (isWood) {
+        L.polygon(coords, {
+          color: WOOD_BORDER, weight: 0.7, opacity: 0.6,
+          fillColor: WOOD_FILL, fillOpacity: 0.6,
+          interactive: false
+        }).addTo(greenLayer);
+      } else {
+        L.polygon(coords, {
+          color: PARK_BORDER, weight: 0.8, opacity: 0.7,
+          fillColor: PARK_FILL, fillOpacity: 0.65,
+          interactive: false
+        }).addTo(greenLayer);
+      }
+    });
+  });
+}
+
+loadGreenAndWater();
 
 let geojsonLayer = null;
 let geojsonData  = null;
